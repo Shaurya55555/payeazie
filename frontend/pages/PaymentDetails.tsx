@@ -1,0 +1,1038 @@
+import React, { useMemo, useState } from 'react';
+import { Link, useParams } from 'react-router-dom';
+import { usePaymentDetails } from '../hooks/usePaymentDetails';
+import { PaymentService } from '../services/payments';
+import StatusBadge from '../components/ui/StatusBadge';
+import {
+  Activity,
+  AlertCircle,
+  ArrowDown,
+  ArrowLeft,
+  ArrowUp,
+  Calendar,
+  CheckCircle2,
+  Clock,
+  CreditCard,
+  DollarSign,
+  Hash,
+  Loader2,
+  RefreshCw,
+  RotateCcw,
+  Server,
+  ShieldAlert,
+  User,
+  XCircle,
+} from 'lucide-react';
+import { cn } from '../utils/cn';
+
+const toTitleCase = (value: string | null | undefined) => {
+  if (!value) return 'Unknown';
+
+  return value
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+};
+
+const formatDateTime = (timestamp: string) =>
+  new Date(timestamp).toLocaleString('en-US', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
+
+const getOperationBadgeClassName = (operationSource: string) => {
+  if (operationSource === 'admin_triggered') {
+    return 'border-violet-200 bg-violet-50 text-violet-700';
+  }
+
+  if (operationSource === 'user_triggered') {
+    return 'border-sky-200 bg-sky-50 text-sky-700';
+  }
+
+  return 'border-slate-200 bg-slate-50 text-slate-700';
+};
+
+const PaymentDetails: React.FC = () => {
+  const { id } = useParams<{ id: string }>();
+  const { payment, loading, error, notFound, refetch, elapsedTime } = usePaymentDetails(id || '');
+
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
+  const [refundInFlight, setRefundInFlight] = useState(false);
+  const [refundError, setRefundError] = useState<string | null>(null);
+  const [refundReasonInput, setRefundReasonInput] = useState('');
+  const [retryInFlight, setRetryInFlight] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
+  const [recoveryActionInFlight, setRecoveryActionInFlight] = useState<'reconcile' | 'restart' | null>(null);
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
+
+  const filteredAndSortedAuditLog = useMemo(() => {
+    if (!payment?.auditLog.length) return [];
+
+    const filtered =
+      statusFilter === 'all'
+        ? payment.auditLog
+        : payment.auditLog.filter((entry) => entry.toStatus.toLowerCase() === statusFilter.toLowerCase());
+
+    return [...filtered].sort((a, b) => {
+      const dateA = new Date(a.createdAt).getTime();
+      const dateB = new Date(b.createdAt).getTime();
+      return sortOrder === 'asc' ? dateA - dateB : dateB - dateA;
+    });
+  }, [payment?.auditLog, sortOrder, statusFilter]);
+
+  const availableStatuses = useMemo(() => {
+    if (!payment?.auditLog.length) return [];
+    return Array.from(new Set(payment.auditLog.map((entry) => entry.toStatus.toLowerCase())));
+  }, [payment?.auditLog]);
+
+  if (loading) {
+    return (
+      <div className="flex h-[50vh] items-center justify-center">
+        <div className="text-center">
+          <Loader2 className="mx-auto mb-3 h-8 w-8 animate-spin text-brand-600" />
+          <p className="text-sm text-slate-500">Loading payment details...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (notFound || !payment) {
+    return (
+      <div className="flex h-[50vh] flex-col items-center justify-center px-4 text-center">
+        <div className="mb-4 rounded-full bg-red-50 p-4">
+          <AlertCircle className="h-8 w-8 text-red-500" />
+        </div>
+        <h2 className="text-xl font-bold text-slate-900">Payment Not Found</h2>
+        <p className="mt-2 max-w-md text-slate-500">
+          Could not retrieve payment details for ID:{' '}
+          <span className="rounded bg-slate-100 px-2 py-0.5 font-mono">{id}</span>
+        </p>
+        <Link
+          to="/dashboard"
+          className="mt-6 inline-flex items-center gap-2 font-medium text-brand-600 transition-colors hover:text-brand-700"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Return to Dashboard
+        </Link>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex h-[50vh] flex-col items-center justify-center px-4 text-center">
+        <div className="mb-4 rounded-full bg-red-50 p-4">
+          <Server className="h-8 w-8 text-red-500" />
+        </div>
+        <h2 className="text-xl font-bold text-slate-900">Internal Server Error</h2>
+        <p className="mt-2 max-w-md text-slate-500">{error}</p>
+        <div className="mt-6 flex gap-3">
+          <button
+            onClick={() => refetch()}
+            className="inline-flex items-center gap-2 rounded-lg bg-brand-600 px-4 py-2 font-medium text-white transition-colors hover:bg-brand-700"
+          >
+            <RefreshCw className="h-4 w-4" />
+            Retry
+          </button>
+          <Link
+            to="/dashboard"
+            className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-4 py-2 font-medium text-slate-700 transition-colors hover:bg-slate-50"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Dashboard
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  const status = payment.status.toLowerCase();
+  const isFailed = status === 'failed';
+  const isProcessing = status === 'processing';
+  const isRefunded = status === 'refunded';
+  const processingState = payment.processing;
+  const processingRecovery = payment.processing?.recovery;
+  const isStuckProcessing = Boolean(processingState?.isStuck);
+  const refundReason = refundReasonInput.trim();
+  const canRefund = Boolean(payment.refund?.eligible && !refundInFlight && refundReason.length >= 5);
+  const canRetry = Boolean(payment.retry?.eligible && !retryInFlight);
+  const canReconcileProcessing = Boolean(processingRecovery?.canReconcile && !recoveryActionInFlight);
+  const canRestartProcessing = Boolean(processingRecovery?.canRestart && !recoveryActionInFlight);
+  const showRefundSafetyCard = Boolean(!payment.refundDetails && payment.refund && !payment.refund.eligible);
+  const showRetrySafetyCard = Boolean(payment.retry && !payment.retry.eligible && !isFailed);
+
+  const handleRefund = async () => {
+    if (!payment.refund?.eligible || refundInFlight) return;
+
+    const confirmed = window.confirm(
+      `Refund ${new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: payment.currency,
+      }).format(parseFloat(payment.amount))} for order ${payment.orderId}?`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      setRefundError(null);
+      setRefundInFlight(true);
+      await PaymentService.refundPayment(payment.id, refundReason);
+      setRefundReasonInput('');
+      await refetch();
+    } catch (err: any) {
+      setRefundError(err.message || 'Refund failed. Please try again.');
+    } finally {
+      setRefundInFlight(false);
+    }
+  };
+
+  const handleRetry = async () => {
+    if (!payment.retry?.eligible || retryInFlight) return;
+
+    const confirmed = window.confirm(
+      `Retry payment ${payment.orderId}? This will requeue the failed payment for another processing attempt.`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      setRetryError(null);
+      setRetryInFlight(true);
+      await PaymentService.retryPayment(payment.id);
+      await refetch();
+    } catch (err: any) {
+      setRetryError(err.message || 'Retry failed. Please try again.');
+    } finally {
+      setRetryInFlight(false);
+    }
+  };
+
+  const handleReconcileProcessing = async () => {
+    if (!processingRecovery?.canReconcile || recoveryActionInFlight) return;
+
+    const confirmed = window.confirm(
+      `Reconcile payment ${payment.orderId}? This will query the gateway and apply the latest final status.`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      setRecoveryError(null);
+      setRecoveryActionInFlight('reconcile');
+      await PaymentService.reconcileProcessingPayment(payment.id);
+      await refetch();
+    } catch (err: any) {
+      setRecoveryError(err.message || 'Reconciliation failed. Please try again.');
+    } finally {
+      setRecoveryActionInFlight(null);
+    }
+  };
+
+  const handleRestartProcessing = async () => {
+    if (!processingRecovery?.canRestart || recoveryActionInFlight) return;
+
+    const confirmed = window.confirm(
+      `Restart processing for ${payment.orderId}? This is only safe because no gateway charge has been recorded for this stuck payment.`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      setRecoveryError(null);
+      setRecoveryActionInFlight('restart');
+      await PaymentService.restartProcessingPayment(payment.id);
+      await refetch();
+    } catch (err: any) {
+      setRecoveryError(err.message || 'Restart failed. Please try again.');
+    } finally {
+      setRecoveryActionInFlight(null);
+    }
+  };
+
+  const steps = isFailed
+    ? [
+        { id: 'pending', label: 'Pending', icon: Clock },
+        { id: 'processing', label: 'Processing', icon: Activity },
+        { id: 'failed', label: 'Failed', icon: XCircle },
+      ]
+    : [
+        { id: 'pending', label: 'Pending', icon: Clock },
+        { id: 'processing', label: 'Processing', icon: Activity },
+        { id: 'succeeded', label: 'Succeeded', icon: CheckCircle2 },
+        ...(isRefunded ? [{ id: 'refunded', label: 'Refunded', icon: RotateCcw }] : []),
+      ];
+
+  const currentStepIndex = steps.findIndex((step) => step.id === status);
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-4 md:p-8">
+      <div className="mx-auto max-w-6xl">
+        <Link
+          to="/dashboard"
+          className="mb-6 inline-flex items-center gap-2 text-slate-600 transition-colors hover:text-slate-900"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          <span className="font-medium">Back to Dashboard</span>
+        </Link>
+
+        <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+          <div className="border-b border-slate-200 p-6 md:p-8">
+            <div className="mb-6 flex flex-col justify-between gap-4 md:flex-row md:items-center">
+              <div>
+                <div className="mb-2 flex items-center gap-3">
+                  <h1 className="text-2xl font-bold text-slate-900">Payment Details</h1>
+                  <StatusBadge status={status} size="md" showIcon={true} />
+                </div>
+                <p className="flex items-center gap-2 text-slate-500">
+                  ID:
+                  <span className="select-all rounded bg-slate-100 px-2 py-0.5 font-mono text-sm text-slate-700">
+                    {payment.id}
+                  </span>
+                </p>
+              </div>
+              <div className="text-left md:text-right">
+                <div className="text-3xl font-bold text-slate-900">
+                  {new Intl.NumberFormat('en-US', {
+                    style: 'currency',
+                    currency: payment.currency,
+                  }).format(parseFloat(payment.amount))}
+                </div>
+                <p className="mt-1 text-sm text-slate-400">{payment.currency}</p>
+                {payment.refundDetails && (
+                  <p className="mt-2 text-sm font-semibold text-orange-700">Fully refunded</p>
+                )}
+              </div>
+            </div>
+
+            {isProcessing && !isStuckProcessing && (
+              <div className="flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 p-4">
+                <Loader2 className="h-5 w-5 shrink-0 animate-spin text-amber-600" />
+                <div className="flex-1">
+                  <p className="text-sm font-medium text-amber-900">Processing payment...</p>
+                  <p className="mt-0.5 text-xs text-amber-700">{elapsedTime}s elapsed</p>
+                </div>
+                <button
+                  onClick={() => refetch()}
+                  className="rounded-lg p-2 transition-colors hover:bg-amber-100"
+                  title="Refresh"
+                >
+                  <RefreshCw className="h-4 w-4 text-amber-700" />
+                </button>
+              </div>
+            )}
+
+            {isProcessing && isStuckProcessing && (
+              <div className="rounded-xl border border-red-200 bg-gradient-to-r from-red-50 via-amber-50 to-white p-5">
+                <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-600" />
+                    <div className="space-y-1">
+                      <p className="text-sm font-semibold uppercase tracking-wide text-red-700">Processing Recovery Needed</p>
+                      <p className="text-lg font-bold text-slate-900">
+                        This payment has been processing for {processingState?.elapsedSeconds || elapsedTime}s.
+                      </p>
+                      <p className="text-sm text-slate-700">{processingRecovery?.message}</p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2 text-sm md:min-w-80">
+                    <div className="rounded-lg border border-red-200 bg-white px-3 py-2">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-red-700">Started</p>
+                      <p className="mt-1 font-medium text-slate-900">
+                        {processingState?.startedAt ? formatDateTime(processingState.startedAt) : 'Unknown'}
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-red-200 bg-white px-3 py-2">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-red-700">Gateway Charge</p>
+                      <p className="mt-1 font-medium text-slate-900">
+                        {processingState?.hasGatewayCharge ? 'Recorded' : 'Not recorded'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 flex flex-wrap gap-3">
+                  {processingRecovery?.canReconcile && (
+                    <button
+                      onClick={handleReconcileProcessing}
+                      disabled={!canReconcileProcessing}
+                      className={cn(
+                        'inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
+                        canReconcileProcessing
+                          ? 'bg-red-600 text-white hover:bg-red-700'
+                          : 'cursor-not-allowed bg-red-100 text-red-500'
+                      )}
+                    >
+                      <RefreshCw className={cn('h-4 w-4', recoveryActionInFlight === 'reconcile' && 'animate-spin')} />
+                      {recoveryActionInFlight === 'reconcile' ? 'Reconciling...' : 'Reconcile Now'}
+                    </button>
+                  )}
+                  {processingRecovery?.canRestart && (
+                    <button
+                      onClick={handleRestartProcessing}
+                      disabled={!canRestartProcessing}
+                      className={cn(
+                        'inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
+                        canRestartProcessing
+                          ? 'bg-amber-600 text-white hover:bg-amber-700'
+                          : 'cursor-not-allowed bg-amber-100 text-amber-500'
+                      )}
+                    >
+                      <RotateCcw className={cn('h-4 w-4', recoveryActionInFlight === 'restart' && 'animate-spin')} />
+                      {recoveryActionInFlight === 'restart' ? 'Restarting...' : 'Restart Processing'}
+                    </button>
+                  )}
+                  <button
+                    onClick={() => refetch()}
+                    className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                    Refresh Status
+                  </button>
+                </div>
+
+                {recoveryError && <p className="mt-3 text-sm text-red-700">{recoveryError}</p>}
+              </div>
+            )}
+
+            {payment.failureDetails && (
+              <div className="mt-4 rounded-lg border border-red-200 bg-red-50 p-4">
+                <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                  <div className="flex items-start gap-3">
+                    <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-red-600" />
+                    <div className="space-y-1">
+                      <p className="text-sm font-semibold text-red-900">Failure Summary</p>
+                      <p className="text-sm text-red-800">{payment.failureDetails.reason}</p>
+                      <div className="flex flex-wrap gap-2 pt-2 text-xs">
+                        {payment.failureDetails.code && (
+                          <span className="rounded-full border border-red-300 bg-white px-2 py-1 text-red-700">
+                            Code: {payment.failureDetails.code}
+                          </span>
+                        )}
+                        {payment.failureDetails.worker && (
+                          <span className="rounded-full border border-red-300 bg-white px-2 py-1 text-red-700">
+                            Worker: {payment.failureDetails.worker}
+                          </span>
+                        )}
+                        {payment.failureDetails.jobId && (
+                          <span className="rounded-full border border-red-300 bg-white px-2 py-1 font-mono text-red-700">
+                            Job: {payment.failureDetails.jobId}
+                          </span>
+                        )}
+                        <span className="rounded-full border border-red-300 bg-white px-2 py-1 text-red-700">
+                          Failed at: {formatDateTime(payment.failureDetails.failedAt)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {payment.retry ? (
+                    <div className="rounded-xl border border-red-200 bg-white p-4 md:min-w-[280px]">
+                      <div className="flex items-start gap-3">
+                        <RotateCcw className="mt-0.5 h-5 w-5 shrink-0 text-red-600" />
+                        <div className="space-y-1">
+                          <p className="text-sm font-semibold text-slate-900">Retry Payment</p>
+                          <p className="text-sm text-slate-600">
+                            Attempt {Math.min(payment.retry.attemptsUsed + 1, payment.retry.maxAttempts)} of{' '}
+                            {payment.retry.maxAttempts}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="mt-3 space-y-2 text-sm text-slate-700">
+                        <p>{payment.retry.message}</p>
+                        <p>
+                          {payment.retry.attemptsRemaining} attempt
+                          {payment.retry.attemptsRemaining === 1 ? '' : 's'} remaining
+                        </p>
+                        {payment.retry.availableAt && payment.retry.state === 'cooldown' && (
+                          <p>Available again at {formatDateTime(payment.retry.availableAt)}</p>
+                        )}
+                        {payment.retry.lastRetriedAt && (
+                          <p>Last retried at {formatDateTime(payment.retry.lastRetriedAt)}</p>
+                        )}
+                      </div>
+
+                      <button
+                        onClick={handleRetry}
+                        disabled={!canRetry}
+                        className={cn(
+                          'mt-4 inline-flex w-full items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
+                          canRetry
+                            ? 'bg-red-600 text-white hover:bg-red-700'
+                            : 'cursor-not-allowed bg-red-100 text-red-500'
+                        )}
+                      >
+                        <RotateCcw className={cn('h-4 w-4', retryInFlight && 'animate-spin')} />
+                        {retryInFlight ? 'Retrying...' : 'Retry Payment'}
+                      </button>
+
+                      {retryError && <p className="mt-3 text-sm text-red-700">{retryError}</p>}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            )}
+
+            {payment.refundDetails && (
+              <div className="mt-4 rounded-xl border border-orange-200 bg-gradient-to-r from-orange-50 via-amber-50 to-white p-5">
+                <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                  <div className="flex items-start gap-3">
+                    <RotateCcw className="mt-0.5 h-5 w-5 shrink-0 text-orange-600" />
+                    <div className="space-y-1">
+                      <p className="text-sm font-semibold uppercase tracking-wide text-orange-700">Refund Completed</p>
+                      <p className="text-lg font-bold text-slate-900">
+                        {new Intl.NumberFormat('en-US', {
+                          style: 'currency',
+                          currency: payment.currency,
+                        }).format(parseFloat(payment.amount))} returned to the customer
+                      </p>
+                      <p className="text-sm text-orange-800">{payment.refundDetails.reason}</p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 text-sm md:min-w-80">
+                    <div className="rounded-lg border border-orange-200 bg-white px-3 py-2">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-orange-700">Refunded at</p>
+                      <p className="mt-1 font-medium text-slate-900">{formatDateTime(payment.refundDetails.refundedAt)}</p>
+                    </div>
+                    <div className="rounded-lg border border-orange-200 bg-white px-3 py-2">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-orange-700">Triggered by</p>
+                      <p className="mt-1 font-medium text-slate-900">
+                        {payment.refundDetails.actor?.email || toTitleCase(payment.refundDetails.triggeredBy)}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2 text-xs">
+                  <span className="rounded-full border border-orange-300 bg-white px-2 py-1 text-orange-700">
+                    Source: {toTitleCase(payment.refundDetails.triggeredBy)}
+                  </span>
+                  {payment.refundDetails.worker && (
+                    <span className="rounded-full border border-orange-300 bg-white px-2 py-1 text-orange-700">
+                      Worker: {payment.refundDetails.worker}
+                    </span>
+                  )}
+                  {payment.refundDetails.jobId && (
+                    <span className="rounded-full border border-orange-300 bg-white px-2 py-1 font-mono text-orange-700">
+                      Job: {payment.refundDetails.jobId}
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {!payment.refundDetails && payment.refund?.eligible && (
+              <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 p-4">
+                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                  <div className="flex items-start gap-3">
+                    <RotateCcw className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" />
+                    <div>
+                      <p className="text-sm font-semibold text-emerald-900">Refund Available</p>
+                      <p className="mt-0.5 text-sm text-emerald-800">
+                        This payment can be refunded because it has completed successfully.
+                      </p>
+                      <label className="mt-3 block">
+                        <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-emerald-900">
+                          Refund reason
+                        </span>
+                        <textarea
+                          value={refundReasonInput}
+                          onChange={(event) => setRefundReasonInput(event.target.value)}
+                          rows={3}
+                          maxLength={280}
+                          placeholder="Explain why this refund is being issued."
+                          className="w-full rounded-lg border border-emerald-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-all focus:border-transparent focus:ring-2 focus:ring-emerald-500"
+                        />
+                      </label>
+                      <p className="mt-1 text-xs text-emerald-800">
+                        This reason is stored in the audit trail with the user and timestamp.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleRefund}
+                    disabled={!canRefund}
+                    className={cn(
+                      'inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
+                      canRefund
+                        ? 'bg-emerald-600 text-white hover:bg-emerald-700'
+                        : 'cursor-not-allowed bg-emerald-200 text-emerald-700'
+                    )}
+                  >
+                    <RotateCcw className={cn('h-4 w-4', refundInFlight && 'animate-spin')} />
+                    {refundInFlight ? 'Refunding...' : 'Refund Payment'}
+                  </button>
+                </div>
+                {refundReason.length < 5 && (
+                  <p className="mt-3 text-sm text-amber-700">
+                    Enter at least 5 characters so the refund audit trail records why this refund was triggered.
+                  </p>
+                )}
+                {refundError && (
+                  <p className="mt-3 text-sm text-red-700">{refundError}</p>
+                )}
+              </div>
+            )}
+
+            {(showRefundSafetyCard || showRetrySafetyCard) && (
+              <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <p className="text-sm font-semibold uppercase tracking-wide text-slate-700">Action Guardrails</p>
+                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                  {showRefundSafetyCard && (
+                    <div className="rounded-lg border border-slate-200 bg-white p-4">
+                      <div className="flex items-start gap-3">
+                        <RotateCcw className="mt-0.5 h-5 w-5 shrink-0 text-slate-500" />
+                        <div>
+                          <p className="text-sm font-semibold text-slate-900">Refund unavailable</p>
+                          <p className="mt-1 text-sm text-slate-600">{payment.refund?.message}</p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {showRetrySafetyCard && (
+                    <div className="rounded-lg border border-slate-200 bg-white p-4">
+                      <div className="flex items-start gap-3">
+                        <RotateCcw className="mt-0.5 h-5 w-5 shrink-0 text-slate-500" />
+                        <div>
+                          <p className="text-sm font-semibold text-slate-900">Retry unavailable</p>
+                          <p className="mt-1 text-sm text-slate-600">{payment.retry?.message}</p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="border-b border-slate-200 bg-slate-50 px-6 py-8 md:px-8">
+            <div className="relative mx-auto flex max-w-2xl items-center justify-between">
+              <div className="absolute left-0 top-5 -z-10 h-1 w-full bg-slate-200"></div>
+              <div
+                className={cn(
+                  'absolute left-0 top-5 -z-10 h-1 transition-all duration-700',
+                  isFailed ? 'bg-red-500' : isRefunded ? 'bg-orange-500' : 'bg-emerald-500'
+                )}
+                style={{
+                  width: currentStepIndex >= 0 ? `${(currentStepIndex / (steps.length - 1)) * 100}%` : '0%',
+                }}
+              />
+
+              {steps.map((step, index) => {
+                const isCompleted = index <= currentStepIndex;
+                const StepIcon = step.icon;
+
+                return (
+                  <div key={step.id} className="relative z-10 flex flex-col items-center gap-3 bg-slate-50">
+                    <div
+                      className={cn(
+                        'flex h-10 w-10 items-center justify-center rounded-full border-2 shadow-sm transition-all',
+                        isCompleted
+                          ? step.id === 'failed'
+                            ? 'border-red-500 bg-red-100 text-red-600'
+                            : step.id === 'refunded'
+                              ? 'border-orange-500 bg-orange-100 text-orange-600'
+                            : 'border-emerald-500 bg-emerald-100 text-emerald-600'
+                          : 'border-slate-300 bg-white text-slate-400'
+                      )}
+                    >
+                      <StepIcon className="h-5 w-5" />
+                    </div>
+                    <span
+                      className={cn(
+                        'text-xs font-semibold uppercase tracking-wider',
+                        isCompleted ? 'text-slate-900' : 'text-slate-400'
+                      )}
+                    >
+                      {step.label}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-6 p-6 md:grid-cols-3 md:p-8">
+            <section className="space-y-4 rounded-xl border border-slate-200 p-5">
+              <h3 className="flex items-center gap-2 border-b border-slate-100 pb-2 font-semibold text-slate-900">
+                <Hash className="h-4 w-4" />
+                Order Information
+              </h3>
+              <div className="space-y-4">
+                <div className="flex items-start gap-3">
+                  <div className="rounded-lg bg-brand-50 p-2 text-brand-600">
+                    <Hash className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <p className="text-sm text-slate-500">Order ID</p>
+                    <p className="font-medium text-slate-900">{payment.orderId}</p>
+                  </div>
+                </div>
+                <div className="flex items-start gap-3">
+                  <div className="rounded-lg bg-green-50 p-2 text-green-600">
+                    <DollarSign className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <p className="text-sm text-slate-500">Amount</p>
+                    <p className="text-lg font-bold text-slate-900">
+                      {new Intl.NumberFormat('en-US', {
+                        style: 'currency',
+                        currency: payment.currency,
+                      }).format(parseFloat(payment.amount))}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="space-y-4 rounded-xl border border-slate-200 p-5">
+              <h3 className="flex items-center gap-2 border-b border-slate-100 pb-2 font-semibold text-slate-900">
+                <CreditCard className="h-4 w-4" />
+                Gateway & Worker
+              </h3>
+              <div className="space-y-3 text-sm">
+                <div>
+                  <p className="text-slate-500">Gateway Provider</p>
+                  <p className="font-medium text-slate-900">{toTitleCase(payment.gateway.provider)}</p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Gateway Charge ID</p>
+                  <p className="break-all font-mono text-slate-900">
+                    {payment.gatewayTransactionId || <span className="italic text-slate-400">Pending...</span>}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Gateway Status</p>
+                  <p className="font-medium text-slate-900">{toTitleCase(payment.gateway.lastKnownStatus)}</p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Processing Worker</p>
+                  <p className="font-medium text-slate-900">
+                    {payment.processingDetails?.worker || payment.latestActivity?.worker || 'Not available'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Last Job ID</p>
+                  <p className="break-all font-mono text-slate-900">
+                    {payment.latestActivity?.jobId || payment.processingDetails?.jobId || 'Not available'}
+                  </p>
+                </div>
+              </div>
+            </section>
+
+            <section className="space-y-4 rounded-xl border border-slate-200 p-5">
+              <h3 className="flex items-center gap-2 border-b border-slate-100 pb-2 font-semibold text-slate-900">
+                <Calendar className="h-4 w-4" />
+                Timeline Context
+              </h3>
+              <div className="space-y-3 text-sm">
+                <div>
+                  <p className="text-slate-500">Created</p>
+                  <p className="font-medium text-slate-900">{formatDateTime(payment.createdAt)}</p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Last Updated</p>
+                  <p className="font-medium text-slate-900">{formatDateTime(payment.updatedAt)}</p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Processing Started</p>
+                  <p className="font-medium text-slate-900">
+                    {payment.processingDetails ? formatDateTime(payment.processingDetails.startedAt) : 'Not started'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Latest Activity</p>
+                  <p className="font-medium text-slate-900">
+                    {payment.latestActivity?.summary || 'No activity recorded'}
+                  </p>
+                  {payment.latestActivity && (
+                    <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                      <span>{formatDateTime(payment.latestActivity.createdAt)}</span>
+                      <span
+                        className={cn(
+                          'rounded-full border px-2 py-0.5 font-medium',
+                          getOperationBadgeClassName(payment.latestActivity.operationSource)
+                        )}
+                      >
+                        {payment.latestActivity.operationLabel}
+                      </span>
+                    </div>
+                  )}
+                </div>
+                <div>
+                  <p className="text-slate-500">Processing Health</p>
+                  <p className="font-medium text-slate-900">
+                    {payment.processing?.active
+                      ? payment.processing.isStuck
+                        ? 'Stuck - manual recovery available'
+                        : 'Healthy processing'
+                      : 'Not processing'}
+                  </p>
+                  {payment.processing?.active && payment.processing.startedAt && (
+                    <p className="mt-1 text-xs text-slate-500">
+                      Started {formatDateTime(payment.processing.startedAt)}
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <p className="text-slate-500">Refund Status</p>
+                  <p className="font-medium text-slate-900">
+                    {payment.refund?.state === 'refunded'
+                      ? 'Refunded'
+                      : payment.refund?.eligible
+                        ? 'Eligible for refund'
+                        : 'Not eligible for refund'}
+                  </p>
+                  {payment.refund?.message && (
+                    <p className="mt-1 text-xs text-slate-500">{payment.refund.message}</p>
+                  )}
+                  {payment.refund?.refundedAt && (
+                    <p className="mt-1 text-xs text-slate-500">{formatDateTime(payment.refund.refundedAt)}</p>
+                  )}
+                </div>
+                <div>
+                  <p className="text-slate-500">Retry Status</p>
+                  <p className="font-medium text-slate-900">
+                    {payment.retry?.eligible
+                      ? `Ready for retry (${payment.retry.attemptsRemaining} remaining)`
+                      : payment.retry?.state === 'cooldown'
+                        ? 'Retry cooling down'
+                        : payment.retry?.state === 'exhausted'
+                          ? 'Retry limit reached'
+                          : 'Not retryable'}
+                  </p>
+                  {payment.retry?.message && (
+                    <p className="mt-1 text-xs text-slate-500">{payment.retry.message}</p>
+                  )}
+                  {payment.retry?.availableAt && payment.retry.state === 'cooldown' && (
+                    <p className="mt-1 text-xs text-slate-500">{formatDateTime(payment.retry.availableAt)}</p>
+                  )}
+                </div>
+                {payment.refundDetails && (
+                  <>
+                    <div>
+                      <p className="text-slate-500">Amount Returned</p>
+                      <p className="font-medium text-slate-900">
+                        {new Intl.NumberFormat('en-US', {
+                          style: 'currency',
+                          currency: payment.currency,
+                        }).format(parseFloat(payment.amount))}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-slate-500">Refund Reason</p>
+                      <p className="font-medium text-slate-900">{payment.refundDetails.reason}</p>
+                    </div>
+                  </>
+                )}
+                <div>
+                  <p className="text-slate-500">Idempotency Key</p>
+                  <p className="break-all font-mono text-xs text-slate-900">{payment.idempotencyKey}</p>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          {payment.auditLog.length > 0 && (
+            <div className="border-t border-slate-200 bg-slate-50 p-6 md:p-8">
+              <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                <h3 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-slate-900">
+                  <Activity className="h-4 w-4" />
+                  Audit Trail
+                  <span className="rounded-full bg-slate-200 px-2 py-0.5 text-xs font-normal text-slate-500">
+                    {filteredAndSortedAuditLog.length} {filteredAndSortedAuditLog.length === 1 ? 'entry' : 'entries'}
+                  </span>
+                </h3>
+
+                <div className="flex flex-wrap items-center gap-3">
+                  <select
+                    value={statusFilter}
+                    onChange={(event) => setStatusFilter(event.target.value)}
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 focus:border-transparent focus:outline-none focus:ring-2 focus:ring-brand-500"
+                  >
+                    <option value="all">All statuses</option>
+                    {availableStatuses.map((entryStatus) => (
+                      <option key={entryStatus} value={entryStatus}>
+                        {toTitleCase(entryStatus)}
+                      </option>
+                    ))}
+                  </select>
+
+                  <button
+                    onClick={() => setSortOrder((current) => (current === 'asc' ? 'desc' : 'asc'))}
+                    className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-700 transition-colors hover:bg-slate-50"
+                    title={`Sort ${sortOrder === 'asc' ? 'descending' : 'ascending'}`}
+                  >
+                    {sortOrder === 'desc' ? <ArrowDown className="h-4 w-4" /> : <ArrowUp className="h-4 w-4" />}
+                    <span>{sortOrder === 'desc' ? 'Newest first' : 'Oldest first'}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                {filteredAndSortedAuditLog.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className={cn(
+                      'rounded-lg border-2 bg-white p-4 transition-all',
+                      entry.toStatus === 'succeeded' && 'border-emerald-200 bg-emerald-50/30',
+                      entry.toStatus === 'failed' && 'border-red-200 bg-red-50/30',
+                      entry.toStatus === 'refunded' && 'border-orange-200 bg-orange-50/30',
+                      entry.toStatus === 'processing' && 'border-amber-200 bg-amber-50/30',
+                      !['succeeded', 'failed', 'processing', 'refunded'].includes(entry.toStatus) && 'border-slate-200'
+                    )}
+                  >
+                    <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <StatusBadge status={entry.toStatus} size="sm" showIcon={true} />
+                          {entry.fromStatus && (
+                            <span className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">
+                              From {toTitleCase(entry.fromStatus)}
+                            </span>
+                          )}
+                          <span
+                            className={cn(
+                              'rounded-full border px-2 py-1 text-xs font-medium',
+                              getOperationBadgeClassName(entry.operationSource)
+                            )}
+                          >
+                            {entry.operationLabel}
+                          </span>
+                          <span className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">
+                            Source: {toTitleCase(entry.triggeredBy)}
+                          </span>
+                        </div>
+
+                        <p className="font-medium text-slate-900">{entry.summary}</p>
+
+                        <div className="flex flex-wrap gap-2 text-xs">
+                          {entry.worker && (
+                            <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-slate-700">
+                              Worker: {entry.worker}
+                            </span>
+                          )}
+                          {entry.jobId && (
+                            <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-1 font-mono text-slate-700">
+                              Job: {entry.jobId}
+                            </span>
+                          )}
+                          {entry.chargeId && (
+                            <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-1 font-mono text-slate-700">
+                              Charge: {entry.chargeId}
+                            </span>
+                          )}
+                          {entry.failureCode && (
+                            <span className="rounded-full border border-red-200 bg-red-50 px-2 py-1 text-red-700">
+                              Code: {entry.failureCode}
+                            </span>
+                          )}
+                          {entry.actor?.email && (
+                            <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-slate-700">
+                              <span className="inline-flex items-center gap-1">
+                                <User className="h-3 w-3" />
+                                {entry.actor.email}
+                              </span>
+                            </span>
+                          )}
+                        </div>
+
+                        {entry.failureReason && (
+                          <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
+                            {entry.failureReason}
+                          </div>
+                        )}
+
+                        {entry.refundReason && (
+                          <div className="rounded-md border border-orange-200 bg-orange-50 px-3 py-2 text-sm text-orange-800">
+                            Refund reason: {entry.refundReason}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="shrink-0 text-sm text-slate-500 md:text-right">
+                        <p>{formatDateTime(entry.createdAt)}</p>
+                        {entry.gatewayProvider && (
+                          <p className="mt-1 text-xs text-slate-400">
+                            Gateway: {toTitleCase(entry.gatewayProvider)}
+                            {entry.gatewayStatus ? ` · ${toTitleCase(entry.gatewayStatus)}` : ''}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="flex gap-3 border-t border-slate-200 bg-white p-6 md:p-8">
+            <button
+              onClick={() => refetch()}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-4 py-2 font-medium text-slate-700 transition-colors hover:bg-slate-50"
+              disabled={refundInFlight || retryInFlight || Boolean(recoveryActionInFlight)}
+            >
+              <RefreshCw className={cn('h-4 w-4', (refundInFlight || retryInFlight || recoveryActionInFlight) && 'animate-spin')} />
+              Refresh
+            </button>
+            {isProcessing && processingRecovery?.canReconcile && (
+              <button
+                onClick={handleReconcileProcessing}
+                disabled={!canReconcileProcessing}
+                className={cn(
+                  'inline-flex items-center gap-2 rounded-lg px-4 py-2 font-medium transition-colors',
+                  canReconcileProcessing
+                    ? 'bg-red-600 text-white hover:bg-red-700'
+                    : 'cursor-not-allowed bg-red-100 text-red-500'
+                )}
+              >
+                <RefreshCw className={cn('h-4 w-4', recoveryActionInFlight === 'reconcile' && 'animate-spin')} />
+                {recoveryActionInFlight === 'reconcile' ? 'Reconciling...' : 'Reconcile Payment'}
+              </button>
+            )}
+            {isProcessing && processingRecovery?.canRestart && (
+              <button
+                onClick={handleRestartProcessing}
+                disabled={!canRestartProcessing}
+                className={cn(
+                  'inline-flex items-center gap-2 rounded-lg px-4 py-2 font-medium transition-colors',
+                  canRestartProcessing
+                    ? 'bg-amber-600 text-white hover:bg-amber-700'
+                    : 'cursor-not-allowed bg-amber-100 text-amber-500'
+                )}
+              >
+                <RotateCcw className={cn('h-4 w-4', recoveryActionInFlight === 'restart' && 'animate-spin')} />
+                {recoveryActionInFlight === 'restart' ? 'Restarting...' : 'Restart Processing'}
+              </button>
+            )}
+            {isFailed && payment.retry && (
+              <button
+                onClick={handleRetry}
+                disabled={!canRetry}
+                className={cn(
+                  'inline-flex items-center gap-2 rounded-lg px-4 py-2 font-medium transition-colors',
+                  canRetry
+                    ? 'bg-red-600 text-white hover:bg-red-700'
+                    : 'cursor-not-allowed bg-red-100 text-red-500'
+                )}
+              >
+                <RotateCcw className={cn('h-4 w-4', retryInFlight && 'animate-spin')} />
+                {retryInFlight ? 'Retrying...' : 'Retry Failed Payment'}
+              </button>
+            )}
+            <Link
+              to="/create"
+              className="inline-flex items-center gap-2 rounded-lg bg-brand-600 px-4 py-2 font-medium text-white transition-colors hover:bg-brand-700"
+            >
+              Create New Payment
+            </Link>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default PaymentDetails;
